@@ -81,7 +81,7 @@ jobs:
           fi
           echo "pip check OK (resemblyzer's intentional omissions ignored)"
 
-          python -c "import PySide6, scipy, numpy, pyaudio, anthropic, onnxruntime; print('All deps OK')"
+          python -c "import PySide6, scipy, numpy, pyaudio, anthropic, onnxruntime, cryptography; print('All deps OK')"
           python -c "import onnxruntime, PySide6; print('onnxruntime', onnxruntime.__version__); print('PySide6', PySide6.__version__)"
 
       - name: Generate .icns icon

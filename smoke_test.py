@@ -12,9 +12,9 @@ from audio.auto_labeler import AutoLabeler
 from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
 from pipeline.interview_health import compute_health
-from pipeline.license import (
-    TRIAL_DAYS, days_remaining, is_valid_license, make_license_key, trial_expired,
-)
+from pipeline import license as lic
+from pipeline.license import TRIAL_DAYS, days_remaining, trial_expired
+from pipeline.machine_id import format_machine_id, machine_id, parse_machine_id
 from pipeline.question_detector import QuestionDetector
 from pipeline.transcript import Transcript
 from pipeline.types import Turn
@@ -280,22 +280,117 @@ def test_health_drops_for_one_word_answers() -> None:
     assert h.score < 70, h
 
 
-def test_license_valid_key_accepts_dashes_and_case() -> None:
-    key = make_license_key()
-    assert is_valid_license(key)
-    assert is_valid_license(key.lower())
-    assert is_valid_license(key.replace("-", ""))
-    assert is_valid_license(f"  {key}  ")
+# ── license (v2: signed, machine-bound, time-limited) ────────────────────────
+# Tests sign with a throwaway key pair and pass its public half explicitly, so
+# they never need (or touch) the real signing key.
+
+_DAY = 86400.0
+_NOW = 1_800_000_000.0
+_MACHINE = bytes(range(10))
+_OTHER_MACHINE = bytes(range(1, 11))
+_LEGACY_KEY = "A301-CED5-7D6B-7293-222E-C1BA"   # the retired shared v1 key
 
 
-def test_license_rejects_garbage() -> None:
-    assert not is_valid_license("")
-    assert not is_valid_license("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX")
-    assert not is_valid_license("not a key")
-    # Off by one char
-    key = make_license_key().replace("-", "")
-    tampered = key[:-1] + ("0" if key[-1] != "0" else "1")
-    assert not is_valid_license(tampered)
+def _test_keypair():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return priv, pub
+
+
+def _eval(key, *, first_run_at=_NOW, now=_NOW, pub=None, **kw):
+    return lic.evaluate(key, first_run_at=first_run_at, now=now,
+                        machine=_MACHINE, public_key=pub, **kw)
+
+
+def test_license_v2_roundtrip_and_wrapped_key() -> None:
+    priv, pub = _test_keypair()
+    key = lic.issue_key(priv, _MACHINE, _NOW + 30 * _DAY, licensee="Jane Doe", issued_at=_NOW)
+    assert key.startswith("AS2-")
+    info = lic.check_key(key, _MACHINE, now=_NOW + _DAY, public_key=pub)
+    assert info.licensee == "Jane Doe" and info.expires_at == int(_NOW + 30 * _DAY)
+    # E-mail clients wrap long lines — whitespace inside the key is ignored.
+    wrapped = "\n  ".join(key[i:i + 40] for i in range(0, len(key), 40))
+    assert lic.check_key(wrapped, _MACHINE, now=_NOW, public_key=pub).licensee == "Jane Doe"
+
+
+def test_license_v2_rejections() -> None:
+    priv, pub = _test_keypair()
+    key = lic.issue_key(priv, _MACHINE, _NOW + 30 * _DAY, issued_at=_NOW)
+
+    def reason(k, machine=_MACHINE, now=_NOW):
+        try:
+            lic.check_key(k, machine, now=now, public_key=pub)
+        except lic.LicenseError as e:
+            return e.reason
+        return "ok"
+
+    assert reason(key) == "ok"
+    assert reason(key, machine=_OTHER_MACHINE) == lic.R_WRONG_MACHINE
+    assert reason(key, now=_NOW + 31 * _DAY) == lic.R_LICENSE_EXPIRED
+    assert reason(key, now=_NOW - 2 * _DAY) == lic.R_CLOCK            # clock before issue date
+    tampered = key[:-6] + ("A" if key[-6] != "A" else "B") + key[-5:]
+    assert reason(tampered) == lic.R_INVALID
+    other_priv, _ = _test_keypair()                                    # signed by someone else
+    assert reason(lic.issue_key(other_priv, _MACHINE, _NOW + _DAY, issued_at=_NOW)) == lic.R_INVALID
+    assert reason("") == lic.R_INVALID and reason("AS2-garbage") == lic.R_INVALID
+    assert reason(_LEGACY_KEY) == lic.R_INVALID                        # old key isn't a v2 key
+
+
+def test_license_evaluate_states() -> None:
+    priv, pub = _test_keypair()
+    trial_over = _NOW - (TRIAL_DAYS + 5) * _DAY
+    key = lic.issue_key(priv, _MACHINE, _NOW + 10 * _DAY, issued_at=_NOW - _DAY)
+
+    st = _eval(key, first_run_at=trial_over, pub=pub)
+    assert st.status == lic.S_LICENSED and st.days_left == 10, st
+    assert _eval("", pub=pub).status == lic.S_TRIAL
+    st = _eval("", first_run_at=trial_over, pub=pub)
+    assert st.status == lic.S_BLOCKED and st.reason == lic.R_TRIAL_EXPIRED
+    # Expired license after the trial → blocked with the specific reason.
+    st = _eval(key, first_run_at=trial_over, now=_NOW + 11 * _DAY, pub=pub)
+    assert st.status == lic.S_BLOCKED and st.reason == lic.R_LICENSE_EXPIRED
+    # A bad key during the trial keeps the trial running, with the problem noted.
+    st = _eval("AS2-nonsense", pub=pub)
+    assert st.status == lic.S_TRIAL and st.reason == lic.R_INVALID
+
+
+def test_license_clock_rollback_blocks() -> None:
+    priv, pub = _test_keypair()
+    key = lic.issue_key(priv, _MACHINE, _NOW + 10 * _DAY, issued_at=_NOW - _DAY)
+    # Within a day of the last-seen time is tolerated (NTP / manual fixes).
+    assert _eval(key, last_seen=_NOW + 12 * 3600, pub=pub).status == lic.S_LICENSED
+    st = _eval(key, last_seen=_NOW + 3 * _DAY, pub=pub)
+    assert st.status == lic.S_BLOCKED and st.reason == lic.R_CLOCK
+    # Applies during the trial too.
+    assert _eval("", last_seen=_NOW + 3 * _DAY, pub=pub).reason == lic.R_CLOCK
+
+
+def test_license_legacy_key_grace_period() -> None:
+    trial_over = _NOW - (TRIAL_DAYS + 5) * _DAY
+    assert lic.is_legacy_key(_LEGACY_KEY) and lic.is_legacy_key(_LEGACY_KEY.lower().replace("-", ""))
+    st = _eval(_LEGACY_KEY, first_run_at=trial_over)                  # first launch of this version
+    assert st.status == lic.S_LEGACY_GRACE and st.days_left == lic.LEGACY_GRACE_DAYS, st
+    st = _eval(_LEGACY_KEY, first_run_at=trial_over, legacy_grace_started_at=_NOW - 5 * _DAY)
+    assert st.status == lic.S_LEGACY_GRACE and st.days_left == 2, st
+    st = _eval(_LEGACY_KEY, first_run_at=trial_over, legacy_grace_started_at=_NOW - 8 * _DAY)
+    assert st.status == lic.S_BLOCKED and st.reason == lic.R_LEGACY_RETIRED, st
+
+
+def test_machine_id_format_roundtrip() -> None:
+    shown = format_machine_id(_MACHINE)
+    assert len(shown) == 19 and shown.count("-") == 3, shown
+    assert parse_machine_id(shown) == _MACHINE
+    assert parse_machine_id(shown.lower().replace("-", " ")) == _MACHINE
+    for bad in ("", "ABCD-EFGH", "ABCD-EFGH-IJKL-MNO1"):
+        try:
+            parse_machine_id(bad)
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError:
+            pass
+    mid = machine_id()                 # this computer: stable across calls
+    assert mid and mid == machine_id(), mid
 
 
 def test_trial_countdown() -> None:

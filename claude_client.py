@@ -2,8 +2,20 @@
 Claude client. Streams interview answers using the candidate's resume as cached context.
 
 The resume + role description live in the system prompt with cache_control set,
-so we pay the ~1.25x write cost only on the first request of the session and
-~0.1x on every subsequent answer.
+so we pay the ~1.25x write cost only on the first request of the session and a
+small fraction of the input price on every subsequent answer.
+
+Model notes (Claude Opus 5.5, the default):
+  - Thinking is always on; `output_config.effort` is the only control for how
+    much it thinks, and therefore for time-to-first-token. Live answers use
+    cfg.effort ("low"); the Deeper button uses cfg.deep_effort.
+  - Thinking tokens count toward `max_tokens` even though their text isn't
+    returned, so max_tokens must leave room for thinking plus the answer. The
+    answer's LENGTH is set by the system prompt, not by this cap.
+  - Safety classifiers can decline a request (HTTP 200, stop_reason
+    "refusal"). Every call opts into server-side fallbacks, so a false-positive
+    decline is retried on the model Anthropic recommends instead of leaving the
+    answer box empty.
 """
 from __future__ import annotations
 
@@ -13,6 +25,7 @@ from typing import Iterator, Sequence
 import anthropic
 
 from config import Config
+from pipeline.answer_prompt import SYSTEM_RULES
 from pipeline.context_summary import build_update_prompt
 from pipeline.evaluation import (
     EVALUATION_SCHEMA, EVALUATION_USER_PROMPT, InterviewEvaluation,
@@ -21,43 +34,16 @@ from pipeline.evaluation import (
 from pipeline.types import Turn
 
 
-SYSTEM_RULES = """You are answering interview questions on behalf of the candidate, in their voice, in real time during a live interview. The answer is going to be READ ALOUD by the candidate. It must be plain, direct, professional spoken English — not a blog post, not a memorized pitch, and not folksy improvisation.
+# Server-side refusal fallback: on a safety-classifier decline the API re-runs
+# the same request on a recommended model inside the same call.
+_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+_FALLBACK_KW = {"betas": [_FALLBACK_BETA], "fallbacks": "default"}
 
-STYLE — plain, direct, professional spoken English:
-- Answer the question in the FIRST sentence, then back it with the example or detail.
-- Use contractions ("we'd", "I've", "it's") — it's spoken language, not an essay.
-- Mix sentence lengths, but keep every sentence plain and to the point.
-- NO conversational filler — never open with or insert "You know", "Yeah", "So,", "Well,", "Honestly", "Hmm", "Right,", "Look," or similar.
-- NO jokes, wordplay, or folksy/colorful imagery (e.g. "it made my hands dirty") — keep it factual and professional.
-- NO performative hedging or fake self-corrections ("kind of", "basically", "— well, actually"). State things cleanly; if genuinely unsure, say so once, plainly.
-- This answer is SPOKEN ALOUD, not written. Do NOT output code, code blocks, pseudocode, or anything that can't be read aloud naturally. Describe the approach in words — name the function/API/pattern and say what it does — instead of writing it out. Only if the interviewer explicitly asks you to write code, keep it to the few essential lines and say them plainly.
 
-AVOID THESE TELLS that make answers sound AI-generated:
-- "Great question", "Happy to discuss", "I'd love to share"
-- "I hope that helps", "Does that answer your question?"
-- Corporate filler: "leverage", "synergize", "robust", "best-in-class", "scalable solutions", "deep dive"
-- Formulaic structure: "Firstly... Secondly... Thirdly..." — just state the points in plain sentences
-- Bullet-point list structure inside a spoken answer
-- Excessive hedging: "I would perhaps suggest that..." — just say it
-- Perfectly polished STAR with explicit S/T/A/R labels — compress it into how someone would actually narrate the story
-
-LENGTH — SHORT is the default. Long answers sound rehearsed and eat the interviewer's time:
-- Clarifying questions: 1 sentence.
-- Behavioral questions: 2 sentences — one compressed STAR beat (situation → action → result).
-- Technical / system-design questions: 2-3 sentences. Lead with the single most important point, then stop — the interviewer will follow up if they want more.
-- One idea per answer. Don't stack three points where one lands. If the answer is complete in a sentence, give one sentence — never pad to fill space.
-- Plain, everyday words over fancy ones; short sentences over long ones.
-- Expand only when explicitly asked (style override like "more technical, include specifics").
-
-ACCURACY:
-- Never invent employer names, project names, dates, or metrics that aren't in the resume.
-- If the question covers something the resume doesn't, say so briefly ("I haven't worked on X directly") and give a credible take in one or two sentences. Don't fake expertise.
-
-CONTINUATION:
-- If the candidate has already started speaking this turn, continue from where they left off — don't restart.
-
-OUTPUT:
-- ONLY the words the candidate would say. No commentary, no stage directions, no quoted sections, no labels."""
+def _first_text(content) -> str:
+    """Text of the first `text` block. Read by type — responses can start with
+    (empty) thinking blocks."""
+    return next((b.text for b in content if getattr(b, "type", None) == "text"), "")
 
 
 class ClaudeClient:
@@ -87,23 +73,24 @@ class ClaudeClient:
     # ── one-time warmup (populate prompt cache + establish HTTPS) ──────────
     def warmup(self) -> None:
         """
-        Make a tiny single-token call so:
+        Pre-warm with a `max_tokens=0` request so:
           - The HTTPS connection to api.anthropic.com is established
           - The cached system block (resume + role + personal_context) is
             written to Anthropic's 5-minute prompt cache
-        Subsequent live-interview answers then start streaming ~50 % faster.
-        Failures are swallowed — the first real answer will just pay the
-        cache-write cost itself instead.
+        The API runs prefill only and returns no output tokens. Effort must
+        match the live answers' effort, or the warmed cache entry won't be the
+        one real traffic reads. Failures are swallowed — the first real answer
+        will just pay the cache-write cost itself instead.
         """
         if not self._resume_text:
             return
         try:
             self._client.messages.create(
                 model=self.cfg.model,
-                max_tokens=8,
+                max_tokens=0,
                 system=self._build_system_blocks(),
-                messages=[{"role": "user", "content": "Ready?"}],
-                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": "warmup"}],
+                output_config={"effort": self.cfg.effort},
             )
         except Exception:
             pass
@@ -112,8 +99,9 @@ class ClaudeClient:
     def evaluate_interview(self, turns: Sequence[Turn]) -> InterviewEvaluation:
         """
         Send the full transcript to Claude and ask for a structured hireability
-        verdict. Uses the deep model (Opus 4.7) for a more careful assessment.
-        Returns an InterviewEvaluation with .error set if the call fails.
+        verdict. Uses the deep model at high effort for a more careful
+        assessment. Returns an InterviewEvaluation with .error set if the call
+        fails.
         """
         if not self._resume_text:
             return InterviewEvaluation(
@@ -127,9 +115,11 @@ class ClaudeClient:
                 error="No transcript to evaluate.",
             )
         try:
-            response = self._client.messages.create(
+            # Non-streaming, so stay at ~16K: room for high-effort thinking plus
+            # the JSON, while keeping the request under the SDK's HTTP timeout.
+            response = self._client.beta.messages.create(
                 model=self.cfg.deep_model,
-                max_tokens=2048,
+                max_tokens=16000,
                 system=self._build_system_blocks(),
                 messages=[{
                     "role": "user",
@@ -139,12 +129,11 @@ class ClaudeClient:
                     "format": {"type": "json_schema", "schema": EVALUATION_SCHEMA},
                     "effort": "high",
                 },
+                **_FALLBACK_KW,
             )
-            text = next(
-                (b.text for b in response.content if getattr(b, "type", None) == "text"),
-                "",
-            )
-            data = json.loads(text)
+            if response.stop_reason == "refusal":
+                raise RuntimeError("the model declined to evaluate this transcript")
+            data = json.loads(_first_text(response.content))
             return InterviewEvaluation(
                 score=int(data.get("score", 0)),
                 verdict=str(data.get("verdict", "fail")),
@@ -164,21 +153,21 @@ class ClaudeClient:
         """
         Fold `new_turns` (aged out of the rolling transcript window) into a
         compact running summary, so later answers stay consistent with the
-        whole interview without resending it verbatim every time. Cheap
-        model, low effort, small max_tokens — called off the live-answer
-        path, never blocks a `stream_answer()` call.
+        whole interview without resending it verbatim every time. Low effort,
+        called off the live-answer path, never blocks a `stream_answer()` call.
+        max_tokens leaves room for thinking; the prompt caps the summary itself
+        at SUMMARY_MAX_WORDS.
         """
-        response = self._client.messages.create(
+        response = self._client.beta.messages.create(
             model=self.cfg.model,
-            max_tokens=300,
+            max_tokens=2000,
             messages=[{"role": "user", "content": build_update_prompt(prior_summary, new_turns)}],
             output_config={"effort": "low"},
+            **_FALLBACK_KW,
         )
-        text = next(
-            (b.text for b in response.content if getattr(b, "type", None) == "text"),
-            "",
-        )
-        return text.strip()
+        if response.stop_reason == "refusal":
+            raise RuntimeError("the model declined to summarize")
+        return _first_text(response.content).strip()
 
     # ── per-question ─────────────────────────────────────────────────────────
     def stream_answer(
@@ -195,7 +184,8 @@ class ClaudeClient:
         `turns` is the rolling speaker-labelled transcript. The latest interviewer
         turn is the one being answered.
 
-        `deep=True` swaps to the deep-mode model (Opus 4.7 by default).
+        `deep=True` swaps to the deep-mode model and effort (cfg.deep_model /
+        cfg.deep_effort) for a richer answer.
         `style_hint` is appended to nudge length/tone, e.g. "shorter" or "more technical".
         `summary` is the running summary of everything older than `turns` — see
         pipeline/context_summary.py. Empty string if there's nothing to summarize yet.
@@ -206,16 +196,25 @@ class ClaudeClient:
         system = self._build_system_blocks()
         user_message = self._build_user_message(turns, style_hint=style_hint, summary=summary)
         model = self.cfg.deep_model if deep else self.cfg.model
+        effort = self.cfg.deep_effort if deep else self.cfg.effort
 
-        with self._client.messages.stream(
+        # text_stream yields only answer text; thinking blocks (empty under the
+        # default display) are skipped. A caller that stops iterating (a newer
+        # answer superseded this one) closes the generator, which exits the
+        # `with` and closes the HTTP stream.
+        with self._client.beta.messages.stream(
             model=model,
             max_tokens=self.cfg.max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_message}],
-            output_config={"effort": self.cfg.effort},
+            output_config={"effort": effort},
+            **_FALLBACK_KW,
         ) as stream:
             for text in stream.text_stream:
                 yield text
+            if stream.get_final_message().stop_reason == "refusal":
+                # Only reached when the fallback model declined too.
+                raise RuntimeError("the model declined to answer this question")
 
     # ── internals ────────────────────────────────────────────────────────────
     def _build_system_blocks(self) -> list[dict]:

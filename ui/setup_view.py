@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import Config
-from pipeline.license import days_remaining, is_valid_license
+from pipeline.license import S_LICENSED, evaluate as license_evaluate, status_line
 from resume_loader import load_resume
 from ui.api_key_dialog import ApiKeyDialog
 from ui.audio_device_dialog import AudioDeviceDialog
@@ -46,18 +46,17 @@ class SetupView(QWidget):
         scroll.setWidget(inner)
         root.addWidget(scroll, stretch=1)
 
-        # ── trial / license status (only shown while on a trial) ──
-        if not (cfg.license_key and is_valid_license(cfg.license_key)):
-            days = days_remaining(cfg.first_run_at)
-            self.lbl_trial = QLabel(
-                f"Trial: {days} day{'s' if days != 1 else ''} left  ·  "
-                "Enter a license key after expiry to keep using the app."
-            )
-            self.lbl_trial.setObjectName("hint")
-            self.lbl_trial.setStyleSheet(
-                "color: #f9e2af;" if days <= 7 else "color: #a6adc8;"
-            )
-            outer.addWidget(self.lbl_trial)
+        # ── license / trial status + License… (machine ID, enter a key) ──
+        license_row = QHBoxLayout()
+        self.lbl_license = QLabel()
+        self.lbl_license.setObjectName("hint")
+        self.lbl_license.setWordWrap(True)
+        self.btn_license = QPushButton("License…")
+        self.btn_license.clicked.connect(self._open_license)
+        license_row.addWidget(self.lbl_license, stretch=1)
+        license_row.addWidget(self.btn_license)
+        outer.addLayout(license_row)
+        self._refresh_license_status()
 
         # ── provider row ──
         provider_row = QHBoxLayout()
@@ -289,6 +288,29 @@ class SetupView(QWidget):
         dlg = AudioDeviceDialog(self.cfg, single_device=(self.mode == MODE_HELPER))
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._refresh_audio_label()
+
+    def _license_state(self):
+        return license_evaluate(
+            self.cfg.license_key,
+            first_run_at=self.cfg.first_run_at,
+            last_seen=self.cfg.license_last_seen,
+            legacy_grace_started_at=self.cfg.legacy_grace_started_at,
+        )
+
+    def _refresh_license_status(self) -> None:
+        state = self._license_state()
+        self.lbl_license.setText(status_line(state))
+        # Yellow once a week or less is left (or on any key problem).
+        warn = state.days_left <= 7 or (state.status != S_LICENSED and bool(state.reason))
+        self.lbl_license.setStyleSheet("color: #f9e2af;" if warn else "color: #a6adc8;")
+
+    def _open_license(self) -> None:
+        from ui.license_dialog import LicenseDialog
+        dlg = LicenseDialog(status_text=status_line(self._license_state()), required=False)
+        if dlg.exec() == dlg.DialogCode.Accepted and dlg.key:
+            self.cfg.license_key = dlg.key
+            self.cfg.save()
+            self._refresh_license_status()
 
     def _reenroll_voice(self) -> None:
         dlg = VoiceEnrollDialog(device_index=self.cfg.mic_device_index)

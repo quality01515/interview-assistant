@@ -1,8 +1,7 @@
 """
-STT backend interface — same shape for all three engines:
-    - BatchBackend       (wraps faster-whisper; emits only finals)
-    - WhisperCppBackend  (pywhispercpp; emits partials + finals)
-    - DeepgramBackend    (cloud; emits partials + finals, lowest latency) — added in Feature 3
+STT backend interface — same shape for both engines:
+    - WhisperCppBackend  (pywhispercpp, on-device; emits partials + finals)
+    - DeepgramBackend    (cloud; emits partials + finals, lowest latency)
 
 Audio comes in as chunks tagged with speaker (or None for helper-mode).
 Events come out tagged with `is_final`. Downstream code (echo filter, question
@@ -43,8 +42,8 @@ class STTEvent:
 
 class STTBackend(ABC):
     """
-    Streaming-shaped STT contract. Even the batch backend implements this —
-    it just emits a single `is_final=True` event per utterance, no partials.
+    Streaming-shaped STT contract: backends emit any number of partials
+    (`is_final=False`) followed by one final per utterance.
 
     Lifecycle:
         backend.start(on_event)         # register the consumer callback

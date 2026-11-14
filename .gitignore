@@ -34,3 +34,7 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/
+
+# License signing key — must never be committed (see tools/license_admin.py)
+*.pem
+signing_key*

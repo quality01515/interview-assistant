@@ -5,6 +5,15 @@ using the candidate's resume as the system prompt.
 Uses the official `openai` SDK natively. OpenAI's automatic prompt caching
 kicks in for long system prompts (the resume), so we keep the resume at the
 top of the system message and the rolling transcript in the user turn.
+
+Model notes (GPT-6.1 Terra live / GPT-6.1 Sol deep, the defaults):
+  - Both are reasoning models. `reasoning_effort` controls how much they think
+    and therefore time-to-first-token: live answers use cfg.openai_effort
+    ("none" = no reasoning, fastest), the Deeper button cfg.openai_deep_effort.
+    Set an effort to "" to omit the parameter for a non-reasoning model.
+  - Reasoning tokens count toward `max_completion_tokens`; the answer's length
+    is shaped by the system prompt, not by that cap.
+  - No `temperature`: reasoning models reject custom sampling values.
 """
 from __future__ import annotations
 
@@ -14,6 +23,7 @@ from typing import Iterator, Sequence
 from openai import OpenAI
 
 from config import Config
+from pipeline.answer_prompt import SYSTEM_RULES
 from pipeline.context_summary import build_update_prompt
 from pipeline.evaluation import (
     EVALUATION_SCHEMA, EVALUATION_USER_PROMPT, InterviewEvaluation,
@@ -22,43 +32,11 @@ from pipeline.evaluation import (
 from pipeline.types import Turn
 
 
-SYSTEM_RULES = """You are answering interview questions on behalf of the candidate, in their voice, in real time during a live interview. The answer is going to be READ ALOUD by the candidate. It must be plain, direct, professional spoken English — not a blog post, not a memorized pitch, and not folksy improvisation.
-
-STYLE — plain, direct, professional spoken English:
-- Answer the question in the FIRST sentence, then back it with the example or detail.
-- Use contractions ("we'd", "I've", "it's") — it's spoken language, not an essay.
-- Mix sentence lengths, but keep every sentence plain and to the point.
-- NO conversational filler — never open with or insert "You know", "Yeah", "So,", "Well,", "Honestly", "Hmm", "Right,", "Look," or similar.
-- NO jokes, wordplay, or folksy/colorful imagery (e.g. "it made my hands dirty") — keep it factual and professional.
-- NO performative hedging or fake self-corrections ("kind of", "basically", "— well, actually"). State things cleanly; if genuinely unsure, say so once, plainly.
-- This answer is SPOKEN ALOUD, not written. Do NOT output code, code blocks, pseudocode, or anything that can't be read aloud naturally. Describe the approach in words — name the function/API/pattern and say what it does — instead of writing it out. Only if the interviewer explicitly asks you to write code, keep it to the few essential lines and say them plainly.
-
-AVOID THESE TELLS that make answers sound AI-generated:
-- "Great question", "Happy to discuss", "I'd love to share"
-- "I hope that helps", "Does that answer your question?"
-- Corporate filler: "leverage", "synergize", "robust", "best-in-class", "scalable solutions", "deep dive"
-- Formulaic structure: "Firstly... Secondly... Thirdly..." — just state the points in plain sentences
-- Bullet-point list structure inside a spoken answer
-- Excessive hedging: "I would perhaps suggest that..." — just say it
-- Perfectly polished STAR with explicit S/T/A/R labels — compress it into how someone would actually narrate the story
-
-LENGTH — SHORT is the default. Long answers sound rehearsed and eat the interviewer's time:
-- Clarifying questions: 1 sentence.
-- Behavioral questions: 2 sentences — one compressed STAR beat (situation → action → result).
-- Technical / system-design questions: 2-3 sentences. Lead with the single most important point, then stop — the interviewer will follow up if they want more.
-- One idea per answer. Don't stack three points where one lands. If the answer is complete in a sentence, give one sentence — never pad to fill space.
-- Plain, everyday words over fancy ones; short sentences over long ones.
-- Expand only when explicitly asked (style override like "more technical, include specifics").
-
-ACCURACY:
-- Never invent employer names, project names, dates, or metrics that aren't in the resume.
-- If the question covers something the resume doesn't, say so briefly ("I haven't worked on X directly") and give a credible take in one or two sentences. Don't fake expertise.
-
-CONTINUATION:
-- If the candidate has already started speaking this turn, continue from where they left off — don't restart.
-
-OUTPUT:
-- ONLY the words the candidate would say. No commentary, no stage directions, no quoted sections, no labels."""
+def _effort_kw(effort: str) -> dict:
+    """`reasoning_effort` kwarg, or nothing when effort is blank (for a
+    non-reasoning model, which would reject the parameter)."""
+    effort = (effort or "").strip()
+    return {"reasoning_effort": effort} if effort else {}
 
 
 class OpenAIClient:
@@ -99,9 +77,13 @@ class OpenAIClient:
                 error="No transcript to evaluate.",
             )
         try:
+            # Higher effort for the assessment unless reasoning is turned off
+            # for the deep model (blank effort = non-reasoning model).
+            eval_effort = "high" if self.cfg.openai_deep_effort.strip() else ""
             response = self._client.chat.completions.create(
                 model=self.cfg.openai_deep_model,
-                max_tokens=2048,
+                max_completion_tokens=16000,
+                **_effort_kw(eval_effort),
                 messages=[
                     {"role": "system", "content": self._build_system()},
                     {"role": "user", "content": EVALUATION_USER_PROMPT.format(transcript=transcript)},
@@ -114,7 +96,6 @@ class OpenAIClient:
                         "strict": True,
                     },
                 },
-                temperature=0.3,
             )
             text = response.choices[0].message.content or "{}"
             data = json.loads(text)
@@ -136,19 +117,20 @@ class OpenAIClient:
         """
         Tiny one-shot call to establish the HTTPS connection and prime
         OpenAI's automatic prompt cache (which kicks in for prompts ≥1024
-        tokens). Subsequent answers start streaming ~30-50 % faster.
+        tokens). Same model + effort as live answers so the warmed prefix is
+        the one they reuse.
         """
         if not self._resume_text:
             return
         try:
             self._client.chat.completions.create(
                 model=self.cfg.openai_model,
-                max_tokens=8,
+                max_completion_tokens=16,
+                **_effort_kw(self.cfg.openai_effort),
                 messages=[
                     {"role": "system", "content": self._build_system()},
                     {"role": "user", "content": "Ready?"},
                 ],
-                temperature=0.0,
             )
         except Exception:
             pass
@@ -158,9 +140,9 @@ class OpenAIClient:
         """Same contract as ClaudeClient.summarize() — see there for why."""
         response = self._client.chat.completions.create(
             model=self.cfg.openai_model,
-            max_tokens=300,
+            max_completion_tokens=2000,
+            **_effort_kw(self.cfg.openai_effort),
             messages=[{"role": "user", "content": build_update_prompt(prior_summary, new_turns)}],
-            temperature=0.3,
         )
         return (response.choices[0].message.content or "").strip()
 
@@ -178,6 +160,7 @@ class OpenAIClient:
         system = self._build_system()
         user = self._build_user(turns, style_hint=style_hint, summary=summary)
         model = self.cfg.openai_deep_model if deep else self.cfg.openai_model
+        effort = self.cfg.openai_deep_effort if deep else self.cfg.openai_effort
 
         stream = self._client.chat.completions.create(
             model=model,
@@ -186,12 +169,8 @@ class OpenAIClient:
                 {"role": "user", "content": user},
             ],
             stream=True,
-            max_tokens=self.cfg.max_tokens,
-            # 0.75 gives noticeably more natural phrasing variety than the
-            # earlier 0.4 (which produced the repeated "Great question / I'd
-            # love to share" patterns). Still well below 1.0 — doesn't risk
-            # rambling or off-topic answers.
-            temperature=0.75,
+            max_completion_tokens=self.cfg.max_tokens,
+            **_effort_kw(effort),
         )
         for event in stream:
             try:

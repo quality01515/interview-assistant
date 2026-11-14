@@ -16,6 +16,18 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".interview_assistant"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+# save() writes EVERY field, so an existing config.json pins whatever defaults
+# were current when it was first saved. When a saved value is exactly a
+# previous release's default, upgrade it to the current default on load; a
+# value the user picked themselves is left alone.
+_SUPERSEDED_DEFAULTS: dict[str, set] = {
+    "model": {"claude-opus-4-7"},
+    "deep_model": {"claude-opus-4-7"},
+    "openai_model": {"gpt-4o-mini"},
+    "openai_deep_model": {"gpt-4o"},
+    "max_tokens": {768},
+}
+
 
 @dataclass
 class Config:
@@ -23,27 +35,45 @@ class Config:
     # Timestamp of the first time the app launched (seconds since epoch).
     # Drives the 30-day trial counter. 0 means "this is the first run".
     first_run_at: float = 0.0
-    # If non-empty AND valid, the trial gate is skipped permanently.
+    # Signed, machine-bound, time-limited key (see pipeline/license.py). While
+    # valid, the trial gate is skipped until the key's expiry date.
     license_key: str = ""
+    # Latest wall-clock time the app has seen — a clock set back past this
+    # (beyond a day's tolerance) blocks the app, so a trial or expiry can't be
+    # stretched by turning the date back.
+    license_last_seen: float = 0.0
+    # When an install still holding the retired shared v1 key first launched
+    # this version; its 7-day grace period counts from here.
+    legacy_grace_started_at: float = 0.0
 
     # ── Provider ──────────────────────────────────────────────────────────────
     provider: str = "anthropic"              # "anthropic" or "openai"
     # Backstop cap on a single live answer. The SYSTEM_RULES prompt is what
     # actually shapes answer length (kept short/plain); this just prevents a
-    # runaway. 768 leaves ample headroom for a "Deeper"/"More technical" answer
-    # without letting the default answer sprawl.
-    max_tokens: int = 768
+    # runaway. The default models are reasoning models whose thinking tokens
+    # count toward this cap, so it needs room for the thinking AND the answer —
+    # too small a cap cuts answers off mid-sentence.
+    max_tokens: int = 4096
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
+    # Claude Opus 5.5 always thinks; `effort` controls how much (and therefore
+    # time-to-first-token). "low" keeps live answers fast; the Deeper button
+    # and the end-of-interview assessment think harder.
     anthropic_api_key: str = ""
-    model: str = "claude-opus-4-7"          # switch to "claude-sonnet-4-6" for lower latency
-    deep_model: str = "claude-opus-4-7"     # used by the "deeper answer" hotkey
-    effort: str = "low"                      # low | medium | high | max — low keeps live answers fast
+    model: str = "claude-opus-5-5"          # live answers
+    deep_model: str = "claude-opus-5-5"     # "Deeper" button + assessment
+    effort: str = "low"                      # live answers: low | medium | high | xhigh | max
+    deep_effort: str = "medium"              # "Deeper" button
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
+    # GPT-6.1 Terra is OpenAI's fast model; "none" skips reasoning for the
+    # lowest latency. GPT-6.1 Sol is the stronger model used for Deeper.
+    # Set an effort to "" if you switch to a non-reasoning model.
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"        # fast default for live answers
-    openai_deep_model: str = "gpt-4o"        # used by the "deeper answer" hotkey
+    openai_model: str = "gpt-6.1-terra"      # live answers
+    openai_deep_model: str = "gpt-6.1-sol"   # "Deeper" button + assessment
+    openai_effort: str = "none"              # terra: none | low | medium | high | xhigh | max
+    openai_deep_effort: str = "medium"       # sol:   low | medium | high | xhigh | max
 
     # ── STT ───────────────────────────────────────────────────────────────────
     # "deepgram"   = cloud streaming (lowest latency + server-side diarization,
@@ -173,8 +203,11 @@ class Config:
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 for k, v in data.items():
-                    if hasattr(cfg, k):
-                        setattr(cfg, k, v)
+                    if not hasattr(cfg, k):
+                        continue
+                    if v in _SUPERSEDED_DEFAULTS.get(k, ()):
+                        continue  # keep the current default
+                    setattr(cfg, k, v)
             except (json.JSONDecodeError, OSError):
                 pass
         # Env vars always win over the config file

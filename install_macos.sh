@@ -3,7 +3,7 @@
 # Usage:  chmod +x install_macos.sh && ./install_macos.sh
 #
 # Prerequisites:
-#   - Python 3.9–3.12 (PySide6 does not yet support 3.13+)
+#   - Python 3.10–3.12 (PySide6 does not yet support 3.13+; the LLM SDKs need 3.10+)
 #   - PortAudio (brew install portaudio)
 #   - For system audio loopback: BlackHole (brew install blackhole-2ch)
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 
 VENV_DIR=".venv"
 
-# ── Find a compatible Python (3.9–3.12) ──────────────────────────────────
+# ── Find a compatible Python (3.10–3.12) ─────────────────────────────────
 # PySide6 requires Python <3.13. Homebrew's python3.12 can get Killed:9 on
 # older macOS, so we prefer the python.org framework build first.
 _try_python() {
@@ -25,7 +25,7 @@ _try_python() {
 
 PYTHON=""
 # 1) python.org framework builds (most reliable on older macOS)
-for ver in 3.12 3.11 3.10 3.9; do
+for ver in 3.12 3.11 3.10; do
     fw="/Library/Frameworks/Python.framework/Versions/$ver/bin/python$ver"
     if [ -x "$fw" ] && _try_python "$fw"; then
         PYTHON="$fw"
@@ -34,10 +34,10 @@ for ver in 3.12 3.11 3.10 3.9; do
 done
 # 2) PATH-based candidates (Homebrew, pyenv, etc.)
 if [ -z "$PYTHON" ]; then
-    for candidate in python3.12 python3.11 python3.10 python3.9 python3; do
+    for candidate in python3.12 python3.11 python3.10 python3; do
         if command -v "$candidate" &>/dev/null && _try_python "$candidate"; then
             PY_VER=$("$candidate" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo "0")
-            if [ "$PY_VER" -lt 13 ]; then
+            if [ "$PY_VER" -ge 10 ] && [ "$PY_VER" -lt 13 ]; then
                 PYTHON="$candidate"
                 break
             fi
@@ -45,7 +45,7 @@ if [ -z "$PYTHON" ]; then
     done
 fi
 if [ -z "$PYTHON" ]; then
-    echo "Error: No working Python 3.9–3.12 found."
+    echo "Error: No working Python 3.10–3.12 found."
     echo "Install from https://www.python.org/downloads/ (the macOS universal installer)"
     echo "or via: brew install python@3.12"
     exit 1

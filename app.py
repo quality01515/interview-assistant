@@ -46,7 +46,7 @@ from pipeline.transcript import Transcript
 from pipeline.vad import Segmenter
 from audio.pyaudio_compat import audio_watchdog_message
 from paths import icon_path
-from pipeline.license import is_valid_license, trial_expired
+from pipeline.license import R_CLOCK, S_LEGACY_GRACE, evaluate as license_evaluate
 from ui.evaluation_dialog import EvaluationDialog
 from ui.api_key_dialog import ApiKeyDialog
 from ui.license_dialog import LicenseDialog
@@ -857,6 +857,41 @@ class App(QObject):
             pass
 
 
+def license_gate(cfg: Config) -> bool:
+    """
+    Decide whether the app may start; persists the trial start, the old-key
+    grace start, and the latest time seen (for clock-rollback detection).
+    While the app may not run, shows the license dialog until the user enters
+    a valid key (→ True), fixes the clock and retries, or quits (→ False).
+    """
+    while True:
+        now = time.time()
+        if cfg.first_run_at <= 0:
+            cfg.first_run_at = now
+        state = license_evaluate(
+            cfg.license_key,
+            first_run_at=cfg.first_run_at,
+            last_seen=cfg.license_last_seen,
+            legacy_grace_started_at=cfg.legacy_grace_started_at,
+            now=now,
+        )
+        if state.status == S_LEGACY_GRACE and cfg.legacy_grace_started_at <= 0:
+            cfg.legacy_grace_started_at = now
+        if state.reason != R_CLOCK:
+            # Never advance the high-water mark from a rolled-back clock.
+            cfg.license_last_seen = max(cfg.license_last_seen, now)
+        cfg.save()
+        if state.ok:
+            return True
+        dlg = LicenseDialog(reason=state.reason, info=state.info,
+                            last_seen=state.last_seen, required=True)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return False
+        if dlg.key:
+            cfg.license_key = dlg.key
+        # Loop: re-evaluate with the new key (or the corrected clock).
+
+
 def main() -> int:
     cfg = Config.load()
     qt_app = QApplication(sys.argv)
@@ -886,19 +921,8 @@ def main() -> int:
         return 0
 
     # ── Trial / license gate ───────────────────────────────────────────────
-    # Stamp the first run so the 30-day countdown can start.
-    if cfg.first_run_at <= 0:
-        cfg.first_run_at = time.time()
-        cfg.save()
-    # If trial has expired and we don't already have a valid license, ask
-    # for one. Cancel / invalid → exit cleanly.
-    have_valid_key = bool(cfg.license_key) and is_valid_license(cfg.license_key)
-    if not have_valid_key and trial_expired(cfg.first_run_at):
-        dlg = LicenseDialog()
-        if dlg.exec() != dlg.DialogCode.Accepted or not is_valid_license(dlg.key):
-            return 1
-        cfg.license_key = dlg.key
-        cfg.save()
+    if not license_gate(cfg):
+        return 1
 
     # First-launch: ask for provider + API key if we don't have one saved.
     # Result is persisted in ~/.interview_assistant/config.json — only done once.
