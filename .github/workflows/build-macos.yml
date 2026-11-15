@@ -16,6 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # scipy <1.14 (built from source below for macOS 11 compatibility) does
+      # not compile with the default Xcode 16.4 compiler on macos-15:
+      #   small_dynamic_array.h:145: "reference to non-static member function
+      #   must be called". Xcode 16.2's compiler accepts it, like macos-14 did.
+      - name: Select Xcode 16.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          xcodebuild -version
+          clang --version | head -1
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
