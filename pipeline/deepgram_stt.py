@@ -348,6 +348,10 @@ class DeepgramBackend(STTBackend):
         self._lock = threading.Lock()
         self._on_event: Optional[Callable[[STTEvent], None]] = None
         self._stopped = False
+        # A failed connect used to be silent and was retried on every audio
+        # chunk. Back off per speaker, and tell the user (throttled) why.
+        self._retry_after: dict[Optional[str], float] = {}
+        self._last_error_note: float = 0.0
 
     def start(self, on_event):
         self._on_event = on_event
@@ -371,6 +375,8 @@ class DeepgramBackend(STTBackend):
             self._streams.pop(speaker, None)
         if self._stopped:
             return None
+        if time.time() < self._retry_after.get(speaker, 0.0):
+            return None
         with self._lock:
             if speaker in self._streams:
                 return self._streams[speaker]
@@ -385,9 +391,29 @@ class DeepgramBackend(STTBackend):
                 clear_pcm_buffer=self._clear_pcm,
             )
             if not s.open():
+                self._retry_after[speaker] = time.time() + 3.0
+                self._note_connect_failure(s._open_error)
                 return None
+            self._retry_after.pop(speaker, None)
             self._streams[speaker] = s
             return s
+
+    def _note_connect_failure(self, err: Optional[Exception]) -> None:
+        now = time.time()
+        if now - self._last_error_note < 30.0 or self._on_event is None:
+            return
+        self._last_error_note = now
+        detail = f"{type(err).__name__}: {err}" if err is not None else "timed out"
+        if len(detail) > 300:
+            detail = detail[:297] + "…"
+        try:
+            self._on_event(STTEvent(
+                text=f"[deepgram error] can't connect for live transcription — {detail}",
+                speaker="_status", ts_start=now, ts_end=now,
+                is_final=True, pcm=None,
+            ))
+        except Exception:
+            pass
 
     # ── STTBackend interface ───────────────────────────────────────────────
     def feed(self, pcm: bytes, speaker, ts: float) -> None:

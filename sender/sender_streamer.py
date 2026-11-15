@@ -136,31 +136,48 @@ class SenderStreamer:
             return
         self._running = False
         self._stop_evt.set()
-        # Stop capture first (no more frames produced).
-        for stream in (self._mic_stream, self._loop_stream):
-            try:
-                if stream is not None:
-                    stream.stop_stream()
-                    stream.close()
-            except Exception:
-                pass
+        # Let the capture threads leave their read loop BEFORE closing the
+        # streams. Closing a PortAudio stream while another thread is inside
+        # stream.read() is a native access violation that kills the whole
+        # process with no Python traceback — and a WASAPI loopback read sits
+        # blocked whenever nothing is playing, so "Stop streaming" used to
+        # crash the Sender almost every time. The readers poll
+        # get_read_available() and see _stop_evt within a few ms.
+        stuck = False
+        for t in self._cap_threads:
+            t.join(timeout=1.5)
+            stuck = stuck or t.is_alive()
+        if not stuck:
+            for stream in (self._mic_stream, self._loop_stream):
+                try:
+                    if stream is not None:
+                        stream.stop_stream()
+                        stream.close()
+                except Exception:
+                    pass
+            if self._pa is not None:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+        # else: a reader is still inside a blocking read — leak the streams
+        # rather than crash. They are released when the process exits.
         self._mic_stream = None
         self._loop_stream = None
-        if self._pa is not None:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
-            self._pa = None
-        # Stop the asyncio loop (closes server + drops clients).
-        loop = self._loop
-        if loop is not None:
-            try:
-                loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
+        self._pa = None
+        # Stop the server. _broadcast_loop sees _stop_evt within 0.5 s and
+        # returns, and _async_main's finally closes the listening socket.
+        # (Stopping the loop from outside skips that finally and leaves the
+        # port bound, so a restart would fail with "Could not bind port".)
         if self._loop_thread is not None:
-            self._loop_thread.join(timeout=2.0)
+            self._loop_thread.join(timeout=3.0)
+            loop = self._loop
+            if self._loop_thread.is_alive() and loop is not None:
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except Exception:
+                    pass
+                self._loop_thread.join(timeout=2.0)
         self._cap_threads = []
         self.audio_mode = "idle"
         self.on_client_count(0)
@@ -321,6 +338,15 @@ class SenderStreamer:
                         tag: int, side: str) -> None:
         prefix = bytes([tag])
         while self._running and not self._stop_evt.is_set():
+            # Only read once a full buffer is waiting, so this thread never
+            # sits inside a blocking read() that stop() can't interrupt (a
+            # loopback stream delivers nothing while the PC is silent).
+            try:
+                if stream.get_read_available() < _FRAMES_PER_BUFFER:
+                    time.sleep(0.005)
+                    continue
+            except Exception:
+                pass  # not supported → fall back to a blocking read
             try:
                 raw = stream.read(_FRAMES_PER_BUFFER, exception_on_overflow=False)
             except Exception:

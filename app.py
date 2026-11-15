@@ -23,6 +23,28 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
+# ── TLS certificates for the frozen macOS app. A PyInstaller bundle's OpenSSL
+# looks for CA certificates under the BUILD machine's Python prefix, which
+# doesn't exist on the user's Mac, so every plain ssl.create_default_context()
+# fails verification. The Deepgram SDK's live-transcription WebSocket uses
+# exactly that — so the transcript stayed empty with no visible error, while
+# OpenAI/Anthropic (httpx brings certifi itself) kept working. Point OpenSSL at
+# the bundled certifi CA file (or macOS's own) BEFORE anything opens a socket.
+# An explicit SSL_CERT_FILE from the environment still wins.
+if getattr(sys, "frozen", False) and sys.platform == "darwin":
+    import os as _os
+    if not _os.environ.get("SSL_CERT_FILE"):
+        _ca = None
+        try:
+            import certifi as _certifi
+            _ca = _certifi.where()
+        except Exception:
+            pass
+        if not (_ca and _os.path.isfile(_ca)):
+            _ca = "/etc/ssl/cert.pem"
+        if _os.path.isfile(_ca):
+            _os.environ["SSL_CERT_FILE"] = _ca
+
 import numpy as np
 from PySide6.QtCore import QObject, QSharedMemory, Qt, Signal
 from PySide6.QtGui import QIcon
