@@ -5,7 +5,10 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14  # Apple Silicon runner (M1), macOS 14
+    # Apple Silicon runner. macos-14 was retired by GitHub on 2026-11-02
+    # ("configuration 'macos-14-arm64-us-default' is not supported").
+    # The app still targets macOS 11+ via MACOSX_DEPLOYMENT_TARGET below.
+    runs-on: macos-15
 
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
