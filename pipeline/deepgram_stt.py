@@ -420,7 +420,14 @@ class DeepgramBackend(STTBackend):
         if self._stopped:
             return
         # Retain audio (used as the final's `pcm` for downstream speaker ID).
-        self._pending_pcm.setdefault(speaker, bytearray()).extend(pcm)
+        buf = self._pending_pcm.setdefault(speaker, bytearray())
+        buf.extend(pcm)
+        # Keep only the last 30 s (16 kHz int16). A channel that stays quiet
+        # for a long time (the candidate while the interviewer talks) never
+        # gets a final to clear it, so this grew without bound.
+        excess = len(buf) - 30 * 16000 * 2
+        if excess > 0:
+            del buf[:excess]
         stream = self._get_stream(speaker)
         if stream is None:
             return

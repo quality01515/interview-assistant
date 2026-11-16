@@ -506,23 +506,38 @@ class App(QObject):
         """Segmenter callback — VAD detected end-of-speech for this speaker."""
         self.stt.close_segment(speaker, ts)
 
+    def _interviewer_audible_near(self, event: STTEvent, text: str) -> bool:
+        """
+        Was the interviewer channel audible while this candidate utterance was
+        spoken? event.ts_start can't be used for the window — with Deepgram it
+        is the time of the PREVIOUS final on this connection, often minutes
+        earlier — so estimate the utterance span from its length instead
+        (finals arrive ~1 s after the last word).
+        """
+        span = max(3.0, 0.5 * len(text.split()) + 1.5)
+        return self._channel_active("interviewer", event.ts_end - span, event.ts_end)
+
     @staticmethod
     def _clip_peak_rms(pcm: bytes, sr: int) -> float:
         """
-        Peak loudness of a clip: the 95th-percentile RMS across 100 ms windows.
-        Robust to long silences padding the buffer (which would sink a plain
-        mean) — real speech shows loud windows, faint bleed does not.
+        Peak loudness of a clip: the 3rd-loudest 100 ms window in its last
+        30 s. Independent of how much silence pads the clip — with Deepgram the
+        clip holds ALL audio since the previous final, so a short answer after
+        a long listen is mostly silence, and the old 95th-percentile measure
+        rated real speech as silent. Real speech has several loud windows;
+        faint bleed has none; a single click can't pass on its own.
         """
         arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        arr = arr[-int(sr * 30):]
         if arr.size == 0:
             return 0.0
         w = max(1, int(sr * 0.1))
         n = arr.size // w
         if n == 0:
             return float(np.sqrt(np.mean(arr * arr)))
-        win = arr[: n * w].reshape(n, w)
-        rms = np.sqrt(np.mean(win * win, axis=1))
-        return float(np.percentile(rms, 95))
+        win = arr[-n * w:].reshape(n, w)
+        rms = np.sort(np.sqrt(np.mean(win * win, axis=1)))
+        return float(rms[-min(3, n)])
 
     def _resolve_by_voice(self, event: STTEvent, tag: Optional[str]) -> str:
         """
@@ -656,14 +671,21 @@ class App(QObject):
         # direct speech (bleed rms < ~300 vs direct rms in the thousands). A
         # microphone noise gate drops that faint bleed while keeping real
         # speech. `event.speaker is not None` ⇒ channel mode (not helper).
+        #
+        # The gate only applies while the interviewer was actually audible: with
+        # the interviewer silent there is nothing to bleed, and a quiet mic (a
+        # webcam mic across the room, a VM's passed-through mic) must not lose
+        # the candidate's real speech. Previously this gate dropped EVERY
+        # candidate line from mics that peak below mic_gate_rms.
         if speaker == "candidate" and event.speaker is not None:
-            if event.is_final and event.pcm:
+            bleed_possible = self._interviewer_audible_near(event, text)
+            if event.is_final and event.pcm and bleed_possible:
                 if self._clip_peak_rms(event.pcm, self.cfg.sample_rate) < self.cfg.mic_gate_rms:
                     # Peak too faint to be the candidate → interviewer bleed.
                     # Also erase any partial of it already on screen.
                     self._retract_candidate_partial()
                     return
-            if not event.is_final:
+            if not event.is_final and bleed_possible:
                 # PARTIALS carry no PCM, so gate them on the channel's rolling
                 # chunk loudness instead. This is the only guard that can catch
                 # bleed at the START of an interviewer sentence: the text-based

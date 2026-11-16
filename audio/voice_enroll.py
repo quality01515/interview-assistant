@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import numpy as np
 from audio.pyaudio_compat import pyaudio
 
-from audio._pcm import to_mono_16k_int16
+from audio._pcm import PcmConverter
 
 
 _FRAMES_PER_BUFFER = 1024
@@ -71,7 +71,7 @@ class VoiceEnroll(threading.Thread):
             if mic_info is None:
                 mic_info = pa.get_default_input_device_info()
             rate = int(mic_info["defaultSampleRate"])
-            # Native channels + software downmix (to_mono_16k_int16), matching
+            # Native channels + software downmix (PcmConverter), matching
             # the capture path — forced mono garbles some virtual devices.
             channels = int(mic_info["maxInputChannels"]) or 1
             stream = pa.open(
@@ -84,6 +84,8 @@ class VoiceEnroll(threading.Thread):
             )
 
             buffer = bytearray()
+            conv = PcmConverter(sample_rate=rate, channels=channels,
+                                sample_format="int16", target_rate=16000)
             t_start = time.time()
             last_tick = 0.0
             while not self._stop.is_set():
@@ -95,10 +97,7 @@ class VoiceEnroll(threading.Thread):
                     raw = stream.read(_FRAMES_PER_BUFFER, exception_on_overflow=False)
                 except Exception:
                     break
-                pcm = to_mono_16k_int16(
-                    raw, sample_rate=rate, channels=channels,
-                    sample_format="int16", target_rate=16000,
-                )
+                pcm = conv.convert(raw)
                 buffer.extend(pcm)
                 now = time.time()
                 if now - last_tick >= 0.1 and self.on_tick:

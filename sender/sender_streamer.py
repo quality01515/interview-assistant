@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 import numpy as np
 from audio.pyaudio_compat import pyaudio, get_loopback_devices, get_default_loopback, no_loopback_error
-from audio._pcm import to_mono_16k_int16
+from audio._pcm import PcmConverter
 
 
 _TAG_CANDIDATE = 0x01
@@ -337,6 +337,8 @@ class SenderStreamer:
     def _capture_reader(self, stream, rate: int, channels: int, fmt: str,
                         tag: int, side: str) -> None:
         prefix = bytes([tag])
+        conv = PcmConverter(sample_rate=rate, channels=channels,
+                            sample_format=fmt, target_rate=_TARGET_RATE)
         while self._running and not self._stop_evt.is_set():
             # Only read once a full buffer is waiting, so this thread never
             # sits inside a blocking read() that stop() can't interrupt (a
@@ -352,10 +354,7 @@ class SenderStreamer:
             except Exception:
                 break
             try:
-                pcm = to_mono_16k_int16(
-                    raw, sample_rate=rate, channels=channels,
-                    sample_format=fmt, target_rate=_TARGET_RATE,
-                )
+                pcm = conv.convert(raw)
             except Exception:
                 continue
             self._emit_level(side, pcm)

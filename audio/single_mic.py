@@ -12,7 +12,7 @@ from typing import Optional
 from audio.pyaudio_compat import pyaudio
 
 from audio.source import AudioChunk, AudioSource
-from audio._pcm import to_mono_16k_int16
+from audio._pcm import PcmConverter
 from config import Config
 
 
@@ -41,7 +41,7 @@ class SingleMicSource(AudioSource):
         mic_info = self._get_input_device(self.cfg.mic_device_index)
         rate = int(mic_info["defaultSampleRate"])
         # Open at the device's NATIVE channel count and downmix to mono in
-        # software (to_mono_16k_int16 handles channels > 1). Forcing PortAudio
+        # software (PcmConverter handles channels > 1). Forcing PortAudio
         # to mono on a natively-stereo virtual device produces garbled audio.
         channels = int(mic_info["maxInputChannels"]) or 1
         self._stream = self._pa.open(
@@ -84,16 +84,14 @@ class SingleMicSource(AudioSource):
                 pass
 
     def _reader(self, stream, rate: int, channels: int) -> None:
-        target_rate = self.cfg.sample_rate
+        conv = PcmConverter(sample_rate=rate, channels=channels,
+                            sample_format="int16", target_rate=self.cfg.sample_rate)
         while self._running:
             try:
                 raw = stream.read(_FRAMES_PER_BUFFER, exception_on_overflow=False)
             except Exception:
                 break
-            pcm = to_mono_16k_int16(
-                raw, sample_rate=rate, channels=channels,
-                sample_format="int16", target_rate=target_rate,
-            )
+            pcm = conv.convert(raw)
             try:
                 self.queue.put_nowait(AudioChunk(pcm=pcm, speaker=None, ts=time.time()))
             except Exception:
